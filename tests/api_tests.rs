@@ -46,6 +46,14 @@ async fn test_server() -> TestServer {
 async fn test_health() {
     let res = test_server().await.get("/health").await;
     res.assert_status_ok();
+    assert_eq!(res.json::<serde_json::Value>()["status"], "ok");
+}
+
+#[tokio::test]
+async fn test_ready_ok_with_live_db() {
+    let res = test_server().await.get("/ready").await;
+    res.assert_status_ok();
+    assert_eq!(res.json::<serde_json::Value>()["status"], "ok");
 }
 
 #[tokio::test]
