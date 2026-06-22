@@ -20,7 +20,7 @@ async fn test_server_with_pool() -> (TestServer, db::Db) {
         webhook_retry_attempts: 1,
         webhook_retry_delay_ms: 0,
         poll_interval_secs: 10,
-        listener_mode: stellargate::config::ListenerMode::Poll,
+        payment_ttl_secs: 3600,
         cors_allowed_origins: vec![],
     }
 }

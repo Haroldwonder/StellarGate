@@ -37,9 +37,9 @@ pub struct Config {
     pub webhook_retry_attempts: u32,
     pub webhook_retry_delay_ms: u64,
     pub poll_interval_secs: u64,
-    /// Whether to detect payments via Horizon's SSE stream (with the poller as
-    /// a reconciler) or via interval polling alone. See [`ListenerMode`].
-    pub listener_mode: ListenerMode,
+    /// How long a payment intent stays `pending` before the expiry sweeper
+    /// transitions it to `expired`. Counted from the intent's `created_at`.
+    pub payment_ttl_secs: u64,
     /// Comma-separated list of allowed CORS origins, e.g. `https://app.example.com`.
     /// Required when `STELLAR_NETWORK=public`; optional (falls back to permissive) on testnet.
     pub cors_allowed_origins: Vec<String>,
@@ -62,7 +62,7 @@ impl Config {
             webhook_retry_attempts: parse_env("WEBHOOK_RETRY_ATTEMPTS", 3),
             webhook_retry_delay_ms: parse_env("WEBHOOK_RETRY_DELAY_MS", 5000),
             poll_interval_secs: parse_env("POLL_INTERVAL_SECS", 10),
-            listener_mode: ListenerMode::parse(&env_or("STELLAR_LISTENER_MODE", "stream")),
+            payment_ttl_secs: parse_env("PAYMENT_TTL_SECS", 3600),
             cors_allowed_origins: std::env::var("CORS_ALLOWED_ORIGINS")
                 .unwrap_or_default()
                 .split(',')

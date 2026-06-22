@@ -531,6 +531,7 @@ mod tests {
             paid_amount: None,
             created_at: "now".into(),
             updated_at: "now".into(),
+            expires_at: "later".into(),
         }
     }
 

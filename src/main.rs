@@ -3,11 +3,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use stellargate::{
-    api,
-    config::{Config, ListenerMode},
-    db, horizon, AppState,
-};
+use stellargate::{api, config::Config, db, expiry, horizon, AppState};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -43,6 +39,9 @@ async fn main() -> Result<()> {
         tokio::spawn(horizon::run_stream_listener(state.clone()));
     }
     tokio::spawn(horizon::run_poller(state.clone()));
+
+    // Background expiry of pending intents that pass their TTL.
+    tokio::spawn(expiry::run_sweeper(state.clone()));
 
     let addr = format!("0.0.0.0:{}", cfg.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
