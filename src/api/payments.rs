@@ -128,6 +128,7 @@ pub async fn create(
             amount: &body.amount,
             asset: &asset,
             webhook_url: body.webhook_url.as_deref(),
+            ttl_secs: state.config.payment_ttl_secs as i64,
         },
     )
     .await?;
@@ -150,11 +151,12 @@ pub struct ListQuery {
     pub status: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+    pub cursor: Option<String>,
 }
 
 const DEFAULT_LIMIT: i64 = 20;
 const MAX_LIMIT: i64 = 100;
-const VALID_STATUSES: [&str; 3] = ["pending", "completed", "failed"];
+const VALID_STATUSES: [&str; 4] = ["pending", "completed", "failed", "expired"];
 
 pub async fn list(
     State(state): State<Arc<AppState>>,
@@ -170,17 +172,48 @@ pub async fn list(
     }
 
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
-    let offset = q.offset.unwrap_or(0).max(0);
 
-    let (payments, total) =
-        db::list_payments(&state.pool, q.status.as_deref(), limit, offset).await?;
+    if let Some(raw_cursor) = &q.cursor {
+        // Keyset (cursor) pagination — stable, O(log n) regardless of page depth.
+        let (cursor_ts, cursor_id) = decode_cursor(raw_cursor)
+            .ok_or_else(|| AppError::bad_request("invalid cursor"))?;
 
-    Ok(Json(json!({
-        "total": total,
-        "limit": limit,
-        "offset": offset,
-        "payments": payments.iter().map(to_json).collect::<Vec<_>>(),
-    })))
+        let payments = db::list_payments_keyset(
+            &state.pool,
+            q.status.as_deref(),
+            limit,
+            Some((&cursor_ts, &cursor_id)),
+        )
+        .await?;
+
+        let next_cursor = if payments.len() == limit as usize {
+            payments.last().map(|p| encode_cursor(&p.created_at, &p.id))
+        } else {
+            None
+        };
+
+        Ok(Json(json!({
+            "payments": payments.iter().map(to_json).collect::<Vec<_>>(),
+            "limit": limit,
+            "next_cursor": next_cursor,
+        })))
+    } else {
+        // Legacy offset pagination — kept for backward compatibility.
+        let offset = q.offset.unwrap_or(0).max(0);
+        let (payments, total) =
+            db::list_payments(&state.pool, q.status.as_deref(), limit, offset).await?;
+
+        // Provide next_cursor to ease migration to keyset pagination.
+        let next_cursor = payments.last().map(|p| encode_cursor(&p.created_at, &p.id));
+
+        Ok(Json(json!({
+            "payments": payments.iter().map(to_json).collect::<Vec<_>>(),
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "next_cursor": next_cursor,
+        })))
+    }
 }
 
 async fn generate_unique_memo(pool: &db::Db) -> Result<String, AppError> {
@@ -210,6 +243,7 @@ fn to_json(p: &db::Payment) -> Value {
         "paid_amount": p.paid_amount,
         "created_at": p.created_at,
         "updated_at": p.updated_at,
+        "expires_at": p.expires_at,
     })
 }
 

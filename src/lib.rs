@@ -1,6 +1,7 @@
 pub mod api;
 pub mod config;
 pub mod db;
+pub mod expiry;
 pub mod horizon;
 pub mod money;
 pub mod webhook;

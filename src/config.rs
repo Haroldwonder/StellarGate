@@ -37,9 +37,9 @@ pub struct Config {
     pub webhook_retry_attempts: u32,
     pub webhook_retry_delay_ms: u64,
     pub poll_interval_secs: u64,
-    /// Whether to detect payments via Horizon's SSE stream (with the poller as
-    /// a reconciler) or via interval polling alone. See [`ListenerMode`].
-    pub listener_mode: ListenerMode,
+    /// How long a payment intent stays `pending` before the expiry sweeper
+    /// transitions it to `expired`. Counted from the intent's `created_at`.
+    pub payment_ttl_secs: u64,
     /// Comma-separated list of allowed CORS origins, e.g. `https://app.example.com`.
     /// Required when `STELLAR_NETWORK=public`; optional (falls back to permissive) on testnet.
     pub cors_allowed_origins: Vec<String>,
@@ -64,7 +64,7 @@ impl Config {
             webhook_retry_attempts: parse_env("WEBHOOK_RETRY_ATTEMPTS", 3),
             webhook_retry_delay_ms: parse_env("WEBHOOK_RETRY_DELAY_MS", 5000),
             poll_interval_secs: parse_env("POLL_INTERVAL_SECS", 10),
-            listener_mode: ListenerMode::parse(&env_or("STELLAR_LISTENER_MODE", "stream")),
+            payment_ttl_secs: parse_env("PAYMENT_TTL_SECS", 3600),
             cors_allowed_origins: std::env::var("CORS_ALLOWED_ORIGINS")
                 .unwrap_or_default()
                 .split(',')
@@ -80,6 +80,52 @@ impl Config {
     /// Horizon poller stays idle rather than scanning the placeholder account.
     pub fn gateway_configured(&self) -> bool {
         !self.gateway_public.is_empty() && self.gateway_public != "UNCONFIGURED"
+    }
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("port", &self.port)
+            .field("database_url", &self.database_url)
+            .field("network", &self.network)
+            .field("horizon_url", &self.horizon_url)
+            .field("gateway_public", &self.gateway_public)
+            .field("gateway_secret", &"***")
+            .field("usdc_issuer", &self.usdc_issuer)
+            .field("webhook_secret", &"***")
+            .field("webhook_retry_attempts", &self.webhook_retry_attempts)
+            .field("webhook_retry_delay_ms", &self.webhook_retry_delay_ms)
+            .field("poll_interval_secs", &self.poll_interval_secs)
+            .field("cors_allowed_origins", &self.cors_allowed_origins)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_redacts_secrets() {
+        let cfg = Config {
+            port: 3000,
+            database_url: "sqlite:test.db".into(),
+            network: "testnet".into(),
+            horizon_url: "https://horizon-testnet.stellar.org".into(),
+            gateway_public: "GPUBLIC".into(),
+            gateway_secret: "super-secret-key".into(),
+            usdc_issuer: "GISSUER".into(),
+            webhook_secret: "webhook-hmac-secret".into(),
+            webhook_retry_attempts: 3,
+            webhook_retry_delay_ms: 5000,
+            poll_interval_secs: 10,
+            cors_allowed_origins: vec![],
+        };
+        let output = format!("{cfg:?}");
+        assert!(!output.contains("super-secret-key"), "gateway_secret must not appear in Debug output");
+        assert!(!output.contains("webhook-hmac-secret"), "webhook_secret must not appear in Debug output");
+        assert!(output.contains("***"), "redacted marker must appear in Debug output");
     }
 }
 
