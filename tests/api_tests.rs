@@ -21,6 +21,7 @@ async fn test_server() -> TestServer {
         webhook_retry_attempts: 1,
         webhook_retry_delay_ms: 0,
         poll_interval_secs: 10,
+        listener_mode: stellargate::config::ListenerMode::Poll,
         cors_allowed_origins: vec![],
     };
     let pool = SqlitePoolOptions::new()

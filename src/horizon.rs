@@ -1,14 +1,23 @@
 //! Stellar Horizon integration: detecting and verifying on-chain payments.
 //!
-//! A background poller periodically asks Horizon for the most recent payments
-//! into the gateway account, matches them against pending payment intents by
-//! transaction memo, verifies the asset and amount, and transitions the intent
-//! to `completed` (or `failed` on underpayment), firing a webhook either way.
+//! Payments into the gateway account are detected one of two ways (selected by
+//! [`crate::config::ListenerMode`]):
+//!
+//! * [`run_stream_listener`] subscribes to Horizon's Server-Sent-Events payment
+//!   stream and settles matching intents within ~1s of a payment landing.
+//! * [`run_poller`] periodically asks Horizon for the most recent payments and
+//!   reconciles them. In stream mode it still runs as a fallback that catches
+//!   any events missed while the stream was reconnecting.
+//!
+//! Both paths match records against pending intents by transaction memo, verify
+//! the asset and amount, and transition the intent to `completed` (or `failed`
+//! on underpayment), firing a webhook either way.
 //!
 //! The matching logic in [`verify`] is pure and unit-tested; the networked
-//! [`fetch_recent_payments`] and [`run_poller`] wrap it with I/O.
+//! functions wrap it with I/O.
 
 use crate::{db, money, webhook, AppState};
+use futures_util::StreamExt;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -167,28 +176,49 @@ pub async fn poll_once(state: &Arc<AppState>) -> anyhow::Result<usize> {
         let Some(payment) = by_memo.get(memo) else {
             continue;
         };
-
-        match verify(payment, hp, &state.config.usdc_issuer) {
-            Some(Verdict::Completed {
-                tx_hash,
-                paid_amount,
-            }) => {
-                settle(state, payment, "completed", &tx_hash, &paid_amount, "payment.success").await;
-                settled += 1;
-            }
-            Some(Verdict::Underpaid {
-                tx_hash,
-                paid_amount,
-            }) => {
-                warn!(payment_id = %payment.id, expected = %payment.amount, paid = %paid_amount, "underpayment");
-                settle(state, payment, "failed", &tx_hash, &paid_amount, "payment.failed").await;
-                settled += 1;
-            }
-            None => {}
+        if apply_verdict(state, payment, hp).await {
+            settled += 1;
         }
     }
 
     Ok(settled)
+}
+
+/// Verify a single Horizon payment against `payment` and, if it satisfies the
+/// intent, persist the terminal status and fire its webhook. Returns whether
+/// the intent was settled. This is the one place [`verify`]'s verdict is acted
+/// on, shared by the poller and the stream listener.
+async fn apply_verdict(state: &Arc<AppState>, payment: &db::Payment, hp: &HorizonPayment) -> bool {
+    match verify(payment, hp, &state.config.usdc_issuer) {
+        Some(Verdict::Completed {
+            tx_hash,
+            paid_amount,
+        }) => {
+            settle(state, payment, "completed", &tx_hash, &paid_amount, "payment.success").await;
+            true
+        }
+        Some(Verdict::Underpaid {
+            tx_hash,
+            paid_amount,
+        }) => {
+            warn!(payment_id = %payment.id, expected = %payment.amount, paid = %paid_amount, "underpayment");
+            settle(state, payment, "failed", &tx_hash, &paid_amount, "payment.failed").await;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Reconcile one streamed Horizon payment: look up the pending intent matching
+/// its memo and settle it if the payment satisfies the intent. Unmatched or
+/// non-payment records are silently ignored, exactly as in the poller.
+async fn reconcile_payment(state: &Arc<AppState>, hp: &HorizonPayment) -> anyhow::Result<()> {
+    let Some(memo) = hp.memo() else { return Ok(()) };
+    let Some(payment) = db::find_pending_by_memo(&state.pool, memo).await? else {
+        return Ok(());
+    };
+    apply_verdict(state, &payment, hp).await;
+    Ok(())
 }
 
 /// Persist a terminal status for `payment` and fire its webhook.
@@ -238,6 +268,171 @@ pub async fn run_poller(state: Arc<AppState>) {
             Ok(n) => info!(settled = n, "poll cycle settled payments"),
             Err(e) => warn!(error = %e, "poll cycle failed"),
         }
+    }
+}
+
+/// One parsed Server-Sent-Events block: the fields of a single `\n\n`-delimited
+/// event. See <https://html.spec.whatwg.org/multipage/server-sent-events.html>.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SseEvent {
+    /// The `event:` name, if any (Horizon uses `open` for the greeting).
+    event: Option<String>,
+    /// The `id:` field — Horizon sets it to the paging token, which we reuse as
+    /// the reconnect cursor so no payments are missed across a dropped stream.
+    id: Option<String>,
+    /// The concatenated `data:` lines.
+    data: String,
+}
+
+/// Parse one SSE event block (the text between blank-line delimiters) into its
+/// fields. Comment lines (`:`...) and unrecognised fields such as `retry:` are
+/// ignored. Pure, so it is unit-tested without any network.
+fn parse_sse_block(block: &str) -> SseEvent {
+    let mut ev = SseEvent::default();
+    let mut data_lines: Vec<&str> = Vec::new();
+    for line in block.lines() {
+        // Per the spec a value has its single leading space (if present)
+        // stripped after the colon.
+        if let Some(rest) = line.strip_prefix("data:") {
+            data_lines.push(rest.strip_prefix(' ').unwrap_or(rest));
+        } else if let Some(rest) = line.strip_prefix("event:") {
+            ev.event = Some(rest.strip_prefix(' ').unwrap_or(rest).to_string());
+        } else if let Some(rest) = line.strip_prefix("id:") {
+            ev.id = Some(rest.strip_prefix(' ').unwrap_or(rest).to_string());
+        }
+    }
+    ev.data = data_lines.join("\n");
+    ev
+}
+
+/// Background task that subscribes to Horizon's payment SSE stream for the
+/// gateway account and settles matching intents as records arrive. Reconnects
+/// automatically with exponential backoff, resuming from the last seen cursor
+/// so no payments are missed across a dropped connection. Idles (without
+/// connecting) while no gateway is configured.
+pub async fn run_stream_listener(state: Arc<AppState>) {
+    if !state.config.gateway_configured() {
+        warn!("STELLAR_GATEWAY_PUBLIC is unconfigured; Horizon stream listener disabled");
+        return;
+    }
+
+    info!(account = %state.config.gateway_public, "Horizon payment stream listener started");
+
+    // A dedicated client without the shared client's overall request timeout —
+    // the SSE connection is long-lived and must not be cut off mid-stream.
+    let client = match reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .user_agent(concat!("StellarGate/", env!("CARGO_PKG_VERSION")))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "failed to build stream HTTP client; stream listener disabled");
+            return;
+        }
+    };
+
+    let base_backoff = Duration::from_secs(1);
+    let max_backoff = Duration::from_secs(30);
+    let mut backoff = base_backoff;
+    // Start at the live edge; subsequent reconnects resume from the last event.
+    let mut cursor = "now".to_string();
+
+    loop {
+        let cursor_before = cursor.clone();
+        match stream_once(&state, &client, &mut cursor).await {
+            Ok(()) => debug!("Horizon stream closed by server; reconnecting"),
+            Err(e) => warn!(error = %e, "Horizon stream dropped; reconnecting"),
+        }
+
+        // Reset backoff whenever the connection made progress (advanced the
+        // cursor), so a long-lived stream that drops once reconnects promptly.
+        if cursor != cursor_before {
+            backoff = base_backoff;
+        }
+
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(max_backoff);
+    }
+}
+
+/// Open one SSE connection and process events until the stream ends or errors.
+/// Advances `cursor` to the latest event `id` so a reconnect resumes cleanly.
+async fn stream_once(
+    state: &Arc<AppState>,
+    client: &reqwest::Client,
+    cursor: &mut String,
+) -> anyhow::Result<()> {
+    let url = format!(
+        "{}/accounts/{}/payments?cursor={}&join=transactions",
+        state.config.horizon_url.trim_end_matches('/'),
+        state.config.gateway_public,
+        cursor,
+    );
+
+    let resp = client
+        .get(&url)
+        .header("Accept", "text/event-stream")
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let mut stream = resp.bytes_stream();
+    // Accumulate raw bytes (not lossily-decoded str) so multibyte characters
+    // split across chunk boundaries are never corrupted.
+    let mut buf: Vec<u8> = Vec::new();
+
+    while let Some(chunk) = stream.next().await {
+        buf.extend_from_slice(&chunk?);
+
+        // Dispatch every complete event (terminated by a blank line) in the
+        // buffer, leaving any partial trailing event for the next chunk.
+        while let Some(end) = find_event_end(&buf) {
+            let block: Vec<u8> = buf.drain(..end).collect();
+            let text = String::from_utf8_lossy(&block);
+            handle_stream_event(state, &text, cursor).await;
+        }
+    }
+
+    Ok(())
+}
+
+/// Find the byte index just past the first event delimiter in `buf`, i.e. the
+/// number of leading bytes that form one complete event plus its terminator.
+/// SSE events are separated by a blank line — `\n\n` (LF) or `\r\n\r\n` (CRLF).
+/// Returns `None` if no event is complete yet.
+fn find_event_end(buf: &[u8]) -> Option<usize> {
+    let lf = buf.windows(2).position(|w| w == b"\n\n").map(|i| i + 2);
+    let crlf = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4);
+    match (lf, crlf) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// Parse one streamed event block and, when it carries a payment record, run it
+/// through the shared reconciliation path. Non-payment frames (Horizon's `open`
+/// greeting, keep-alives) are ignored.
+async fn handle_stream_event(state: &Arc<AppState>, block: &str, cursor: &mut String) {
+    let ev = parse_sse_block(block);
+
+    // Advance the reconnect cursor as soon as we learn a newer event id.
+    if let Some(id) = ev.id {
+        *cursor = id;
+    }
+
+    if ev.event.as_deref() == Some("open") || ev.data.is_empty() {
+        return;
+    }
+
+    match serde_json::from_str::<HorizonPayment>(&ev.data) {
+        Ok(hp) => {
+            if let Err(e) = reconcile_payment(state, &hp).await {
+                warn!(error = %e, "failed to reconcile streamed payment");
+            }
+        }
+        // The greeting payload (`"hello"`) and any non-record frames land here.
+        Err(e) => debug!(error = %e, "ignoring non-payment stream frame"),
     }
 }
 
@@ -387,6 +582,59 @@ mod tests {
         let mut hp = native_payment("10", "MEMO1234", "GGATEWAY");
         hp.kind = "create_account".into();
         assert_eq!(verify(&p, &hp, USDC_ISSUER), None);
+    }
+
+    #[test]
+    fn parses_payment_sse_event() {
+        let block = "id: 123456789\nevent: \ndata: {\"type\":\"payment\",\"amount\":\"10.0\"}";
+        let ev = parse_sse_block(block);
+        assert_eq!(ev.id.as_deref(), Some("123456789"));
+        assert_eq!(ev.data, "{\"type\":\"payment\",\"amount\":\"10.0\"}");
+    }
+
+    #[test]
+    fn parses_open_greeting_event() {
+        let block = "retry: 1000\nevent: open\ndata: \"hello\"";
+        let ev = parse_sse_block(block);
+        assert_eq!(ev.event.as_deref(), Some("open"));
+        assert_eq!(ev.data, "\"hello\"");
+        // The greeting payload is not a payment record.
+        assert!(serde_json::from_str::<HorizonPayment>(&ev.data).is_err());
+    }
+
+    #[test]
+    fn joins_multiline_sse_data_and_ignores_comments() {
+        let block = ": keep-alive\ndata: {\"type\":\ndata: \"payment\"}\nid: 99";
+        let ev = parse_sse_block(block);
+        assert_eq!(ev.data, "{\"type\":\n\"payment\"}");
+        assert_eq!(ev.id.as_deref(), Some("99"));
+    }
+
+    #[test]
+    fn streamed_payment_deserializes_into_verifiable_record() {
+        // A single Horizon payment record as pushed over SSE (note: a streamed
+        // record carries its memo inline under `transaction`, same as the page).
+        let data = r#"{
+            "type": "payment",
+            "amount": "10.0000000",
+            "asset_type": "native",
+            "to": "GGATEWAY",
+            "transaction_hash": "abc",
+            "transaction": { "memo": "MEMO1234", "memo_type": "text" }
+        }"#;
+        let hp: HorizonPayment = serde_json::from_str(data).unwrap();
+        let p = pending("XLM", "10.00");
+        assert!(matches!(
+            verify(&p, &hp, USDC_ISSUER),
+            Some(Verdict::Completed { .. })
+        ));
+    }
+
+    #[test]
+    fn find_event_end_detects_complete_events() {
+        assert_eq!(find_event_end(b"data: x\n\nrest"), Some(9));
+        assert_eq!(find_event_end(b"data: x\r\n\r\nrest"), Some(11));
+        assert_eq!(find_event_end(b"data: partial\n"), None);
     }
 
     #[test]

@@ -25,11 +25,11 @@ This project is under active development. The following is implemented:
 - [x] `GET /health` — health check
 - [x] SQLite persistence
 - [x] Input validation (asset, amount as exact stroops, webhook URL)
-- [x] Transaction listener (Horizon polling)
+- [x] Transaction listener (Horizon SSE streaming + interval polling)
 - [x] Payment verification (memo + asset + amount)
 - [x] Webhook dispatch (HMAC-SHA256 signed, with retries)
 - [x] Multi-merchant support (`merchant_id` per payment)
-- [ ] Horizon streaming (currently polled on an interval)
+- [x] Horizon streaming (SSE, with polling as a reconciler)
 - [ ] Dashboard UI
 
 ## Tech Stack
@@ -67,6 +67,7 @@ cp .env.example .env
 | `STELLAR_GATEWAY_PUBLIC` | Your gateway wallet public key | — |
 | `STELLAR_GATEWAY_SECRET` | Your gateway wallet secret key | — |
 | `USDC_ISSUER` | USDC issuer address | testnet issuer |
+| `STELLAR_LISTENER_MODE` | `stream` (SSE + poller reconciler) or `poll` (interval only) | `stream` |
 | `POLL_INTERVAL_SECS` | How often the Horizon poller reconciles | `10` |
 | `WEBHOOK_SECRET` | HMAC signing secret for webhooks | — |
 | `WEBHOOK_RETRY_ATTEMPTS` | Webhook delivery attempts | `3` |
@@ -198,7 +199,7 @@ List payments, newest first.
 1. Developer calls POST /payments
 2. StellarGate returns { destination_address, memo, amount }
 3. End user sends payment via any Stellar wallet
-4. StellarGate listener detects the transaction on Horizon
+4. StellarGate listener detects the transaction on Horizon (SSE stream, ~1s; poller as fallback)
 5. Verifies: correct memo + amount + asset
 6. Updates payment status to "completed"
 7. POSTs webhook event to developer's webhook_url
@@ -223,12 +224,12 @@ Webhooks are signed with `X-StellarGate-Signature` (HMAC-SHA256) so you can veri
 
 ```
 src/
-├── main.rs          # Entry point, server startup, poller spawn, graceful shutdown
+├── main.rs          # Entry point, server startup, listener/poller spawn, graceful shutdown
 ├── lib.rs           # Shared state and module exports
 ├── config.rs        # Environment configuration
 ├── db.rs            # Database queries (SQLite)
 ├── money.rs         # Stroops-based amount parsing/validation
-├── horizon.rs       # Horizon polling listener + payment verification
+├── horizon.rs       # Horizon SSE stream + polling listener + payment verification
 ├── webhook.rs       # HMAC-SHA256 signed webhook dispatch
 └── api/
     ├── mod.rs       # Axum router, layers (CORS/trace/body-limit), 404 fallback
